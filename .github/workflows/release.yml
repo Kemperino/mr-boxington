@@ -383,11 +383,57 @@ jobs:
       # jdx/mr-boxington's identity with no key to distribute. Runs after the
       # upload above, which is what guarantees the release exists.
       # See https://packslip.dev.
+      - name: Install completion syntax checkers
+        timeout-minutes: 5
+        run: |
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y zsh fish
+          # Hosted runners include PowerShell; Namespace images have its signed apt repository.
+          if ! command -v pwsh >/dev/null 2>&1; then
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y powershell
+          fi
+      - name: Publish the CLI specification and completions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p bin
+          tar -xzf release-assets/mbx-x86_64-unknown-linux-gnu.tar.gz -C bin
+          bin/mbx __usage_spec__ > mbx.usage.kdl
+          for shell in bash zsh fish powershell; do
+            bin/mbx completion "$shell" > mbx.$shell
+            test -s mbx.$shell
+            grep -Fq '__complete_word__' mbx.$shell
+            bin/mbx __complete_word__ --shell "$shell" --line 'mbx do' | grep -Fq -- 'doctor'
+          done
+          bash -n mbx.bash
+          zsh -n mbx.zsh
+          fish --no-execute mbx.fish
+          cat > completion-syntax-check.ps1 <<'POWERSHELL'
+          $ErrorActionPreference = 'Stop'
+          foreach ($script in Get-ChildItem -LiteralPath "." -Filter '*.powershell') {
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$null, [ref]$parseErrors)
+            if ($parseErrors.Count) { $parseErrors | Write-Error; exit 1 }
+          }
+          POWERSHELL
+          pwsh -NoProfile -NonInteractive -File completion-syntax-check.ps1
+          gh release upload "$TAG" mbx.usage.kdl mbx.bash mbx.zsh mbx.fish mbx.powershell --repo "$REPO" --clobber
       - uses: jdx/packslip@a0d434ad57571c62dbd0ab5095b4eff607a71fd3 # v1.1.1
         with:
           tag: ${{ inputs.tag }}
           artifacts: release-assets/mbx-*.tar.gz release-assets/mbx-*.zip
           bin: mbx
+          resources: |
+            cli-spec/usage=asset:mbx.usage.kdl
+            completion/bash=asset:mbx.bash
+            completion/zsh=asset:mbx.zsh
+            completion/fish=asset:mbx.fish
+            completion/powershell=asset:mbx.powershell
 
       # Called from release-plz.yml, undrafting is that workflow's job — it
       # happens after this one returns. Run by hand, nothing else will do it,
