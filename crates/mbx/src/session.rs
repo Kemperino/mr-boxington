@@ -27,6 +27,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 mod client;
+pub mod cmake;
 mod diagnostics;
 mod server;
 mod shims;
@@ -100,6 +101,7 @@ pub struct CacheSession {
     rustc_shim: PathBuf,
     rustdoc_shim: PathBuf,
     cc_shims: Option<CcShims>,
+    cmake_shims_dir: PathBuf,
     staging: PathBuf,
     verify: bool,
     incremental: bool,
@@ -206,6 +208,7 @@ impl CacheSession {
             rustc_shim: shim,
             rustdoc_shim,
             cc_shims,
+            cmake_shims_dir: config.cache_dir.join("shims"),
             staging,
             verify: config.verify,
             incremental: config.incremental,
@@ -382,7 +385,19 @@ impl CacheSession {
             "RUSTDOC".into(),
             self.rustdoc_shim.to_string_lossy().into_owned(),
         );
-        self.begin_cc(environment);
+        if let Some(shims) = &self.cc_shims {
+            // Select CMake from the final per-build environment, just as we
+            // do for compilers. Do this before injecting compiler shims: if
+            // installing the CMake adapter fails, leave native builds plain
+            // rather than exposing an unstable compiler identity to CMake.
+            match cmake::environment(&self.cmake_shims_dir, shims, environment) {
+                Ok(cmake_environment) => {
+                    self.begin_cc(environment);
+                    environment.extend(cmake_environment);
+                }
+                Err(error) => warn!("native compiler caching is unavailable: {error:#}"),
+            }
+        }
         if self.incremental {
             // Hand the decision back to cargo, which compiles local packages
             // incrementally in dev profiles and never in release. Not
