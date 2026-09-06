@@ -271,6 +271,16 @@ pub fn place(
         );
         return None;
     }
+    // Cargo keeps its build lock in the old view. Hold those locks across the
+    // link swap, or leave the view alone if a build is still using it. Merely
+    // changing the link can strand Cargo's resolved diagnostic-output paths.
+    let build_locks = match lock_replaced_view(target_dir, &managed, workspace_root) {
+        Ok(locks) => locks,
+        Err(error) => {
+            log::debug!("leaving the managed target directory in place: {error:#}");
+            return None;
+        }
+    };
     // The link is what decides whether placement happens at all, so it goes
     // first and nothing is written until it is in place. A refusal has to leave
     // no trace: an unused directory and record would be counted and reported
@@ -318,6 +328,13 @@ pub fn place(
         }
         return None;
     }
+    // The locks proved no build was using the old view and held that answer
+    // across the link swap, which is the step that could strand a build's
+    // resolved paths. They cannot be held any further: an open handle inside
+    // the old view makes Windows refuse to rename or remove it, and the
+    // relocation below would fail with the link already pointing at a view
+    // that has none of the outputs.
+    drop(build_locks);
     // Cargo would create this itself on the way to writing in it. Doing it here
     // keeps the link from dangling in the meantime, which is what someone
     // listing the workspace would see.
@@ -461,6 +478,43 @@ enum Link {
     Existing,
     Created,
     Replaced(PathBuf),
+}
+
+/// Cargo's lock is in `<profile>/.cargo-lock`, or
+/// `<target-triple>/<profile>/.cargo-lock` for cross-compilation. Do not follow
+/// symlinks into arbitrary directories while inspecting the managed view.
+fn lock_replaced_view(
+    target_dir: &Path,
+    managed: &Path,
+    workspace_root: &Path,
+) -> Result<Vec<fslock::LockFile>> {
+    let Ok(existing) = std::fs::read_link(target_dir) else {
+        return Ok(Vec::new());
+    };
+    if existing == managed
+        || !replaceable_managed_link(&existing, managed, workspace_root)
+        || !existing.exists()
+    {
+        return Ok(Vec::new());
+    }
+    let mut pending = vec![(existing, 0)];
+    let mut locks = Vec::new();
+    while let Some((directory, depth)) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_file() && entry.file_name() == ".cargo-lock" {
+                let mut lock = fslock::LockFile::open(&entry.path())?;
+                if !lock.try_lock()? {
+                    eyre::bail!("Cargo is using {}", directory.display());
+                }
+                locks.push(lock);
+            } else if kind.is_dir() && depth < 2 {
+                pending.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    Ok(locks)
 }
 
 /// Point `target_dir` at `managed` so the paths people type keep working.
