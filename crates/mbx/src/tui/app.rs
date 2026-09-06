@@ -7,6 +7,7 @@
 use crate::events::{ActionOutcome, SessionEvent, SessionState, SessionTail};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How many action rows one session keeps for display.
 ///
@@ -20,16 +21,18 @@ pub(crate) enum Tab {
     Live,
     Sessions,
     Store,
+    Insights,
 }
 
 impl Tab {
-    pub(crate) const ALL: [Tab; 3] = [Tab::Live, Tab::Sessions, Tab::Store];
+    pub(crate) const ALL: [Tab; 4] = [Tab::Live, Tab::Sessions, Tab::Store, Tab::Insights];
 
     pub(crate) fn title(self) -> &'static str {
         match self {
             Self::Live => "Live",
             Self::Sessions => "Sessions",
             Self::Store => "Store",
+            Self::Insights => "Insights",
         }
     }
 
@@ -37,7 +40,8 @@ impl Tab {
         match self {
             Self::Live => Self::Sessions,
             Self::Sessions => Self::Store,
-            Self::Store => Self::Live,
+            Self::Store => Self::Insights,
+            Self::Insights => Self::Live,
         }
     }
 }
@@ -48,6 +52,7 @@ pub(crate) struct Row {
     pub outcome: ActionOutcome,
     pub crate_name: Option<String>,
     pub duration_ns: u64,
+    pub avoided_compiler_ns: u64,
 }
 
 /// What one build's stream has said so far.
@@ -102,6 +107,7 @@ impl Session {
                     outcome,
                     crate_name,
                     duration_ns,
+                    avoided_compiler_ns: detail.avoided_compiler_ns,
                 });
             }
             SessionEvent::Truncated { .. } => self.truncated = true,
@@ -175,9 +181,21 @@ pub(crate) struct App {
     pub tab: Tab,
     pub selected: usize,
     pub scroll: usize,
+    /// Rows back from the newest action; zero follows the build.
+    pub action_scroll: usize,
+    pub insight_scroll: usize,
+    pub store_scroll: usize,
+    pub cheeky: bool,
     pub paused: bool,
     pub store_stats: Option<crate::store::StoreStats>,
     pub savings: crate::savings::Tally,
+    pub sharing: Option<crate::stats::SharingEstimate>,
+    pub health: super::health::Health,
+    pub store_budget: Option<u64>,
+    pub gc_auto: bool,
+    monitoring_since_ms: u64,
+    last_sharing_refresh: Option<Instant>,
+    sharing_worker: Option<std::sync::mpsc::Receiver<Option<crate::stats::SharingEstimate>>>,
 }
 
 impl App {
@@ -188,9 +206,23 @@ impl App {
             tab: Tab::Live,
             selected: 0,
             scroll: 0,
+            action_scroll: 0,
+            insight_scroll: 0,
+            store_scroll: 0,
+            cheeky: true,
             paused: false,
             store_stats: None,
             savings: crate::savings::Tally::default(),
+            sharing: None,
+            health: super::health::Health::default(),
+            store_budget: None,
+            gc_auto: true,
+            monitoring_since_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            last_sharing_refresh: None,
+            sharing_worker: None,
         };
         app.discover(limit);
         app.refresh_store();
@@ -203,13 +235,41 @@ impl App {
         if self.paused {
             return;
         }
+        let selected_id = self
+            .selected_session()
+            .filter(|session| session.workspace_root.is_some())
+            .map(|session| session.id.clone());
         self.discover(limit);
+        let now = Instant::now();
+        let recent_since_ms = self.monitoring_since_ms.max(
+            (SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64)
+                .saturating_sub(super::health::WINDOW.as_millis() as u64),
+        );
+        let (mut hits, mut misses) = (0, 0);
         for (tail, session) in &mut self.tails {
             for event in tail.read() {
+                if let SessionEvent::Action { ts_ms, outcome, .. } = &event
+                    && *ts_ms > recent_since_ms
+                {
+                    hits += u64::from(matches!(outcome, ActionOutcome::Hit));
+                    misses += u64::from(matches!(outcome, ActionOutcome::Miss));
+                }
+                // Keep the same activity in view while new work arrives. Once
+                // retained history rolls off, the oldest available row wins.
+                if self.action_scroll > 0
+                    && selected_id.as_deref() == Some(session.id.as_str())
+                    && matches!(&event, SessionEvent::Action { .. })
+                {
+                    self.action_scroll = (self.action_scroll + 1).min(MAX_ROWS - 1);
+                }
                 session.apply(event);
             }
             session.state = tail.state();
         }
+        self.health.lookups(now, hits, misses);
         // Newest first, and a running build always above a finished one: the
         // build somebody is watching is the reason they opened this.
         self.tails.sort_by_key(|(tail, session)| {
@@ -218,7 +278,58 @@ impl App {
                 std::cmp::Reverse(tail.id().to_string()),
             )
         });
+        if let Some(id) = selected_id
+            && let Some(index) = self.tails.iter().position(|(_, session)| session.id == id)
+        {
+            self.selected = index;
+        }
         self.selected = self.selected.min(self.tails.len().saturating_sub(1));
+        self.refresh_sharing();
+    }
+
+    pub(crate) fn sharing_loading(&self) -> bool {
+        self.sharing_worker.is_some()
+    }
+
+    fn refresh_sharing(&mut self) {
+        if let Some(worker) = &self.sharing_worker {
+            match worker.try_recv() {
+                Ok(sharing) => {
+                    self.sharing = sharing;
+                    self.sharing_worker = None;
+                    self.last_sharing_refresh = Some(Instant::now());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.sharing_worker = None;
+                    self.last_sharing_refresh = Some(Instant::now());
+                }
+            }
+        }
+        // Attribution walks every workspace's cache closure. Never wait for it
+        // on the input thread, and allow only one scan in flight at a time.
+        if self.tab != Tab::Store
+            || self
+                .last_sharing_refresh
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(30))
+        {
+            return;
+        }
+        let Some(stats) = &self.store_stats else {
+            return;
+        };
+        let bytes = stats.total_bytes();
+        let store = self.store.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name("tui-sharing".into())
+            .spawn(move || {
+                let result = crate::stats::SharingEstimate::read(&store, bytes).ok();
+                let _ = sender.send(result);
+            }) {
+            Ok(_) => self.sharing_worker = Some(receiver),
+            Err(_) => self.last_sharing_refresh = Some(Instant::now()),
+        }
     }
 
     fn discover(&mut self, limit: usize) {
@@ -235,8 +346,16 @@ impl App {
     }
 
     pub(crate) fn refresh_store(&mut self) {
+        if self.paused {
+            return;
+        }
         self.store_stats = crate::store::stats(&self.store).ok();
         self.savings = crate::savings::read_tally(&self.store);
+        self.health.observe_evictions(
+            Instant::now(),
+            self.savings.since_secs,
+            self.savings.freed_store_bytes,
+        );
     }
 
     pub(crate) fn sessions(&self) -> impl Iterator<Item = &Session> {
@@ -260,31 +379,73 @@ impl App {
         self.scroll = 0;
     }
 
+    pub(crate) fn previous_tab(&mut self) {
+        let current = Tab::ALL
+            .iter()
+            .position(|tab| *tab == self.tab)
+            .unwrap_or(0);
+        self.select_tab(Tab::ALL[(current + Tab::ALL.len() - 1) % Tab::ALL.len()]);
+    }
+
     pub(crate) fn select_tab(&mut self, tab: Tab) {
         self.tab = tab;
         self.scroll = 0;
     }
 
     pub(crate) fn select_next(&mut self) {
-        if self.tab == Tab::Live {
-            self.selected = (self.selected + 1).min(self.tails.len().saturating_sub(1));
-            self.scroll = 0;
-        } else {
-            self.scroll = self.scroll.saturating_add(1);
+        if matches!(self.tab, Tab::Live | Tab::Insights) {
+            let next = (self.selected + 1).min(self.tails.len().saturating_sub(1));
+            if next != self.selected {
+                self.selected = next;
+                self.action_scroll = 0;
+                self.insight_scroll = 0;
+            }
+        } else if self.tab == Tab::Sessions {
+            self.scroll = (self.scroll + 1).min(self.tails.len().saturating_sub(1));
         }
     }
 
     pub(crate) fn select_previous(&mut self) {
-        if self.tab == Tab::Live {
-            self.selected = self.selected.saturating_sub(1);
-            self.scroll = 0;
-        } else {
+        if matches!(self.tab, Tab::Live | Tab::Insights) {
+            if self.selected > 0 {
+                self.selected -= 1;
+                self.action_scroll = 0;
+                self.insight_scroll = 0;
+            }
+        } else if self.tab == Tab::Sessions {
             self.scroll = self.scroll.saturating_sub(1);
         }
     }
 
+    pub(crate) fn older_actions(&mut self, page: usize) {
+        if self.tab == Tab::Live {
+            let max = self
+                .selected_session()
+                .map_or(0, |session| session.rows.len().saturating_sub(page.max(1)));
+            self.action_scroll = self.action_scroll.saturating_add(page).min(max);
+        }
+    }
+
+    pub(crate) fn newer_actions(&mut self, page: usize) {
+        if self.tab == Tab::Live {
+            self.action_scroll = self.action_scroll.saturating_sub(page);
+        }
+    }
+
+    pub(crate) fn follow_actions(&mut self) {
+        self.action_scroll = 0;
+    }
+
     pub(crate) fn toggle_pause(&mut self) {
         self.paused = !self.paused;
+        if !self.paused {
+            // Changes accumulated during a pause are not a five-minute sample.
+            self.health = super::health::Health::default();
+            self.monitoring_since_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+        }
     }
 }
 
