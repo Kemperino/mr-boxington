@@ -1077,6 +1077,42 @@ fn models_parallel_frontend_options_in_the_action_key() {
 }
 
 #[test]
+fn models_embedded_metadata_selection_in_the_action_key() {
+    let invocation = |selection: &[&str]| {
+        let mut arguments = vec![
+            "--crate-name=widget",
+            "--crate-type=lib",
+            "--emit=dep-info,metadata,link",
+        ];
+        arguments.extend_from_slice(selection);
+        arguments.push("src/lib.rs");
+        RustcInvocation::parse(&args(&arguments)).unwrap()
+    };
+    let key = |invocation: RustcInvocation| {
+        invocation
+            .action(context(&[("src/lib.rs", "source")]))
+            .unwrap()
+            .digest
+    };
+
+    let disabled = invocation(&["-Zembed-metadata=no"]);
+    assert_eq!(disabled, invocation(&["-Z", "embed-metadata=no"]));
+    assert_ne!(key(disabled), key(invocation(&["-Zembed-metadata=yes"])));
+
+    // Only the two documented spellings are admitted. Any other value keeps
+    // bypassing, so a selection this adapter cannot describe never reaches a
+    // key that claims to describe it.
+    for value in ["off", "true", ""] {
+        let flag = format!("-Zembed-metadata={value}");
+        assert_eq!(
+            RustcInvocation::parse(&args(&[&flag, "src/lib.rs"])),
+            Err(BypassReason::UnknownFlag(flag.clone())),
+            "{flag} should bypass"
+        );
+    }
+}
+
+#[test]
 fn parallel_frontend_options_require_values() {
     for arguments in [
         vec!["-Zthreads", "src/lib.rs"],
