@@ -1162,7 +1162,7 @@ fn parse_optional_duration(value: &str) -> Result<Option<Duration>> {
     parse_duration(value).map(Some)
 }
 
-fn config_file_path() -> Option<PathBuf> {
+pub(crate) fn config_file_path() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join("mbx").join("config.toml"))
 }
 
