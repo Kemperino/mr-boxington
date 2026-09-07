@@ -65,12 +65,7 @@ setup() {
   assert_output 'repaired = true'
 }
 
-@test "edit reports missing editors and unsuccessful exits" {
-  run env -u VISUAL -u EDITOR "$MBX_BIN" edit
-  assert_failure
-  assert_output --partial "config.toml"
-  assert_output --partial 'Set $VISUAL or $EDITOR'
-
+@test "edit reports launch failures and unsuccessful exits" {
   run env VISUAL="$BATS_TEST_TMPDIR/missing-editor" EDITOR= "$MBX_BIN" edit
   assert_failure
   assert_output --partial "failed to launch editor"

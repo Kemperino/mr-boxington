@@ -28,12 +28,7 @@ fn run_with<F>(
 where
     F: FnOnce(&OsStr, &[OsString]) -> io::Result<ExitStatus>,
 {
-    let command = configured_editor(visual, editor).ok_or_else(|| {
-        eyre::eyre!(
-            "no editor is configured for {}\nSet $VISUAL or $EDITOR, then run `mbx edit` again.",
-            path.display()
-        )
-    })?;
+    let command = configured_editor(visual, editor);
     let (program, mut arguments) = split_editor_command(command)?;
 
     if let Some(parent) = path.parent() {
@@ -57,11 +52,17 @@ where
     Ok(ExitCode::SUCCESS)
 }
 
-fn configured_editor<'a>(visual: Option<&'a str>, editor: Option<&'a str>) -> Option<&'a str> {
+fn configured_editor<'a>(visual: Option<&'a str>, editor: Option<&'a str>) -> &'a str {
     visual
         .filter(|value| !value.trim().is_empty())
         .or_else(|| editor.filter(|value| !value.trim().is_empty()))
+        .unwrap_or(DEFAULT_EDITOR)
 }
+
+#[cfg(windows)]
+const DEFAULT_EDITOR: &str = "notepad";
+#[cfg(not(windows))]
+const DEFAULT_EDITOR: &str = "nano";
 
 fn split_editor_command(editor: &str) -> Result<(String, Vec<OsString>)> {
     let mut parts = shell_words::split(editor)
@@ -80,9 +81,9 @@ mod tests {
 
     #[test]
     fn visual_precedes_editor_and_empty_visual_falls_back() {
-        assert_eq!(configured_editor(Some("code"), Some("vim")), Some("code"));
-        assert_eq!(configured_editor(Some("  "), Some("vim")), Some("vim"));
-        assert_eq!(configured_editor(None, Some("")), None);
+        assert_eq!(configured_editor(Some("code"), Some("vim")), "code");
+        assert_eq!(configured_editor(Some("  "), Some("vim")), "vim");
+        assert_eq!(configured_editor(None, Some("")), DEFAULT_EDITOR);
     }
 
     #[test]
@@ -129,19 +130,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(std::fs::read_to_string(path).unwrap(), "not valid toml = [");
-    }
-
-    #[test]
-    fn no_editor_reports_the_path_without_creating_it() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("mbx/config.toml");
-        let error = run_with(&path, Some(" "), None, |_, _| unreachable!())
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains(&path.display().to_string()));
-        assert!(error.contains("VISUAL") && error.contains("EDITOR"));
-        assert!(!path.exists());
     }
 
     #[test]
