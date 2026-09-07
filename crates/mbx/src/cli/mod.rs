@@ -89,7 +89,7 @@ enum Commands {
     Doctor(doctor::DoctorArgs),
     /// Explain cache bypasses, or replay the last build and diagnose its misses.
     Explain(explain::ExplainArgs),
-    /// Open the global configuration in $VISUAL or $EDITOR.
+    /// Open the global configuration in $VISUAL, $EDITOR, or the platform's default editor.
     Edit,
     /// Make plain Cargo commands run through mbx.
     Setup(setup::SetupArgs),

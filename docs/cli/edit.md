@@ -3,7 +3,7 @@
 
 - **Usage:** `mbx edit`
 
-Open the global configuration in $VISUAL or $EDITOR.
+Open the global configuration in $VISUAL, $EDITOR, or the platform's default editor.
 
 ## Flags
 - **`-h --help`** — Print help
