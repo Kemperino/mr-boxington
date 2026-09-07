@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::{store, target, workspace_state};
 use bytesize::ByteSize;
 use eyre::Result;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -78,7 +79,11 @@ pub(super) struct ImportArgs {
 #[derive(usage::Args)]
 pub(super) struct RemoveCacheArgs {
     /// Workspace root to forget.
-    workspace: PathBuf,
+    #[usage(conflicts = "--interactive", required_unless = "--interactive")]
+    workspace: Option<PathBuf>,
+    /// Select recorded workspaces to remove.
+    #[usage(long, conflicts = "workspace")]
+    interactive: bool,
 }
 
 pub(super) fn run(config: &Config, command: CacheCommands) -> Result<ExitCode> {
@@ -111,7 +116,15 @@ pub(super) fn run(config: &Config, command: CacheCommands) -> Result<ExitCode> {
             cache_import(config, &args.archive).map(|()| ExitCode::SUCCESS)
         }
         CacheCommands::Remove(args) => {
-            cache_remove(config, &args.workspace).map(|()| ExitCode::SUCCESS)
+            if args.interactive {
+                cache_remove_interactive(config)
+            } else {
+                cache_remove(
+                    config,
+                    args.workspace.as_deref().expect("workspace is required"),
+                )
+                .map(|()| ExitCode::SUCCESS)
+            }
         }
     }
 }
@@ -376,6 +389,107 @@ pub(super) fn cache_remove(config: &Config, workspace: &Path) -> Result<()> {
     }
     println!("shared cache objects remain available to other workspaces and normal GC");
     Ok(())
+}
+
+fn cache_remove_interactive(config: &Config) -> Result<ExitCode> {
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        eyre::bail!(
+            "--interactive requires a terminal; use `mbx cache remove <WORKSPACE>` instead"
+        );
+    }
+    eprintln!("Loading recorded workspaces...");
+    let projects = store::projects(&config.store_dir())?;
+    cache_remove_interactive_with(
+        &projects,
+        select_projects,
+        confirm_project_removal,
+        |workspace| cache_remove(config, workspace),
+    )
+}
+
+pub(super) fn cache_remove_interactive_with(
+    projects: &[store::ProjectUsage],
+    select: impl FnOnce(&[store::ProjectUsage]) -> Result<Vec<PathBuf>>,
+    confirm: impl FnOnce(&[PathBuf]) -> Result<bool>,
+    remove: impl FnMut(&Path) -> Result<()>,
+) -> Result<ExitCode> {
+    if projects.is_empty() {
+        println!("no recorded workspaces");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let selected = select(projects)?;
+    if selected.is_empty() || !confirm(&selected)? {
+        return Ok(ExitCode::SUCCESS);
+    }
+    Ok(cache_remove_selected_with(&selected, remove))
+}
+
+fn select_projects(projects: &[store::ProjectUsage]) -> Result<Vec<PathBuf>> {
+    use demand::{DemandOption, MultiSelect};
+
+    let options = projects
+        .iter()
+        .map(|project| {
+            let state = if project.live { "live" } else { "stale" };
+            let description = format!(
+                "{state} | {} build outputs | {} reusable cache (shared)",
+                ByteSize::b(project.target_bytes).display().iec(),
+                ByteSize::b(project.action_bytes).display().iec(),
+            );
+            DemandOption::with_label(
+                project.workspace_root.display().to_string(),
+                project.workspace_root.clone(),
+            )
+            .description(&description)
+        })
+        .collect();
+    match MultiSelect::new("Select workspaces to remove")
+        .description("Space selects; Enter continues. Nothing is selected by default.")
+        .filterable(true)
+        .options(options)
+        .run()
+    {
+        Ok(selected) => Ok(selected),
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn confirm_project_removal(selected: &[PathBuf]) -> Result<bool> {
+    println!("selected workspaces:");
+    for workspace in selected {
+        println!("  {}", workspace.display());
+    }
+    let description = "Removal deletes managed build targets and forgets the selected workspaces' cache claims. Source files remain untouched. Shared cache objects remain available to other workspaces and normal garbage collection. Displayed sizes are logical and may not equal physical disk space reclaimed.";
+    match demand::Confirm::new("Remove the selected workspaces?")
+        .description(description)
+        .affirmative("Remove")
+        .negative("Cancel")
+        .selected(false)
+        .run()
+    {
+        Ok(answer) => Ok(answer),
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(super) fn cache_remove_selected_with(
+    selected: &[PathBuf],
+    mut remove: impl FnMut(&Path) -> Result<()>,
+) -> ExitCode {
+    let mut failed = false;
+    for workspace in selected {
+        if let Err(error) = remove(workspace) {
+            eprintln!("failed to remove {}: {error}", workspace.display());
+            failed = true;
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// Resolve the workspace exactly as Cargo does when recording cache ownership.
