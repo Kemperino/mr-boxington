@@ -37,7 +37,9 @@ pub(super) enum CacheCommands {
     /// empty target directory, restore that state as well. A non-empty target
     /// directory is never replaced.
     Import(ImportArgs),
-    /// Remove one workspace's managed target and cache claims.
+    /// Remove managed targets and cache claims for one workspace or selected workspaces.
+    ///
+    /// Provide exactly one of `<WORKSPACE>` or `--interactive`.
     Remove(RemoveCacheArgs),
 }
 
@@ -77,12 +79,13 @@ pub(super) struct ImportArgs {
 }
 
 #[derive(usage::Args)]
+#[usage(group("removal_mode", required))]
 pub(super) struct RemoveCacheArgs {
     /// Workspace root to forget.
-    #[usage(conflicts = "--interactive", required_unless = "--interactive")]
+    #[usage(group = "removal_mode")]
     workspace: Option<PathBuf>,
     /// Select recorded workspaces to remove.
-    #[usage(long, conflicts = "workspace")]
+    #[usage(long, group = "removal_mode")]
     interactive: bool,
 }
 
